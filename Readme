@@ -1,0 +1,32 @@
+How to run
+
+Install deps:
+
+pip install requests urllib3 PyYAML
+
+
+Scan a single group by path or ID:
+
+python gitlab_inventory_report_all_groups_v2.py \
+  --base-url https://gitlab.example.com \
+  --token <YOUR_PAT> \
+  --group-name parent/subgroup \
+  --out gitlab_projects_report_mygroup.csv
+
+
+Scan the entire instance (everything visible to your token):
+
+python gitlab_inventory_report_all_groups_v2.py \
+  --base-url https://gitlab.example.com \
+  --token <YOUR_PAT> \
+  --out gitlab_projects_report_all.csv \
+  --scan-scope my
+
+
+Admins can truly scan all instance groups:
+
+python gitlab_inventory_report_all_groups_v2.py \
+  --base-url https://gitlab.example.com \
+  --token <ADMIN_PAT_WITH_read_api> \
+  --out gitlab_projects_report_all.csv \
+  --scan-scope all
