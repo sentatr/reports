@@ -30,3 +30,6 @@ python gitlab_inventory_report_all_groups_v2.py \
   --token <ADMIN_PAT_WITH_read_api> \
   --out gitlab_projects_report_all.csv \
   --scan-scope all
+
+
+python user_contribution_report.py --group-name "dev-team" --token <PAT> --disable-ssl-verify
