@@ -1,0 +1,146 @@
+---
+- name: Deploy .NET REST API from Nexus
+  hosts: dotnet_api_servers
+  gather_facts: no
+  vars:
+    # ====== Nexus artifact settings ======
+    nexus_base_url: "https://nexus.example.com"
+    nexus_repository: "releases"                   # e.g. releases, snapshots, etc.
+    nexus_group_path: "com/example/myapi"          # groupId with / instead of .
+    nexus_artifact_id: "my-dotnet-api"
+    nexus_version: "1.0.0"                         # can also be 'latest' if you handle it in the URL
+    nexus_packaging: "zip"                         # dll | zip | nupkg, etc.
+    nexus_classifier: ""                           # optional; leave empty if not used
+
+    # Constructed file name (adjust if your naming pattern differs)
+    artifact_file_name: "{{ nexus_artifact_id }}-{{ nexus_version }}{{ '-' + nexus_classifier if nexus_classifier != '' else '' }}.{{ nexus_packaging }}"
+
+    # Download location on target
+    download_dir: "C:\\temp\\deploy"
+    download_path: "{{ download_dir }}\\{{ artifact_file_name }}"
+
+    # ====== Application settings ======
+    app_service_name: "MyDotNetApiService"
+    app_install_dir: "C:\\apps\\my-dotnet-api"     # Where DLLs / app live
+    app_backup_dir: "C:\\apps\\my-dotnet-api-backup"
+
+    # If package is a zip of your whole app folder
+    is_zip_package: true                           # set to false if it's just a DLL
+
+    # ====== Health check settings ======
+    healthcheck_url: "http://{{ inventory_hostname }}:5000/health"   # change port/path
+    healthcheck_retries: 10
+    healthcheck_delay: 5                           # seconds between retries
+
+  tasks:
+    - name: Ensure download directory exists
+    # Create C:\temp\deploy
+      ansible.windows.win_file:
+        path: "{{ download_dir }}"
+        state: directory
+
+    - name: Stop .NET API Windows service
+      ansible.windows.win_service:
+        name: "{{ app_service_name }}"
+        state: stopped
+      register: stop_result
+
+    - name: Backup existing deployment (if present)
+      ansible.windows.win_file:
+        path: "{{ app_backup_dir }}"
+        state: directory
+
+    - name: Remove previous backup contents
+      ansible.windows.win_file:
+        path: "{{ app_backup_dir }}"
+        state: absent
+      ignore_errors: yes
+
+    - name: Recreate backup folder
+      ansible.windows.win_file:
+        path: "{{ app_backup_dir }}"
+        state: directory
+
+    - name: Copy current app folder to backup
+      ansible.windows.win_copy:
+        src: "{{ app_install_dir }}\\"
+        dest: "{{ app_backup_dir }}\\"
+        remote_src: yes
+      ignore_errors: yes
+
+    # ===================== DOWNLOAD ARTIFACT FROM NEXUS =====================
+
+    - name: Build Nexus artifact URL
+      ansible.builtin.set_fact:
+        nexus_artifact_url: >-
+          {{ nexus_base_url }}/repository/{{ nexus_repository }}/{{ nexus_group_path }}/{{ nexus_artifact_id }}/{{ nexus_version }}/{{ artifact_file_name }}
+
+    - name: Download artifact from Nexus
+      ansible.windows.win_get_url:
+        url: "{{ nexus_artifact_url }}"
+        dest: "{{ download_path }}"
+        force: yes
+
+    # ===================== DEPLOY ARTIFACT =====================
+
+    - name: Ensure app install directory exists
+      ansible.windows.win_file:
+        path: "{{ app_install_dir }}"
+        state: directory
+
+    - name: Clear existing app contents
+      ansible.windows.win_file:
+        path: "{{ app_install_dir }}"
+        state: absent
+      ignore_errors: yes
+
+    - name: Recreate app install directory
+      ansible.windows.win_file:
+        path: "{{ app_install_dir }}"
+        state: directory
+
+    - name: Extract ZIP package into app directory
+      when: is_zip_package
+      community.windows.win_unzip:
+        src: "{{ download_path }}"
+        dest: "{{ app_install_dir }}"
+        overwrite: yes
+
+    - name: Copy single DLL to app directory
+      when: not is_zip_package
+      ansible.windows.win_copy:
+        src: "{{ download_path }}"
+        dest: "{{ app_install_dir }}\\"
+        remote_src: yes
+
+    # ===================== START SERVICE & HEALTH CHECK =====================
+
+    - name: Start .NET API Windows service
+      ansible.windows.win_service:
+        name: "{{ app_service_name }}"
+        state: started
+
+    - name: Wait for service port to open (optional, if you know the port)
+      ansible.builtin.wait_for:
+        host: "{{ inventory_hostname }}"
+        port: 5000               # change if different
+        delay: 5
+        timeout: 60
+      delegate_to: localhost
+
+    - name: Health check - wait for HTTP 200 from API
+      ansible.builtin.uri:
+        url: "{{ healthcheck_url }}"
+        method: GET
+        status_code: 200
+        validate_certs: no       # set to yes for HTTPS with proper certs
+      register: healthcheck_result
+      retries: "{{ healthcheck_retries }}"
+      delay: "{{ healthcheck_delay }}"
+      until: healthcheck_result.status == 200
+
+    - name: Show deployment result
+      ansible.builtin.debug:
+        msg: >
+          Deployment completed successfully on {{ inventory_hostname }}.
+          Health check HTTP status: {{ healthcheck_result.status }}
