@@ -105,36 +105,104 @@ log.info(f"  Collection '{collection_name}': {len(projects)} project(s)")
 return projects
 ```
 
+def parse_tag_strings(raw_tags: list[str]) -> list[dict]:
+“””
+Parse a list of raw tag name strings into {key, value} dicts.
+Handles formats seen in AzDO UI:
+- “AppInfo:11538-CRF”   → key=AppInfo,      value=11538-CRF
+- “TMT:Scott Simpson”   → key=TMT,           value=Scott Simpson
+- “TPO:Jason Yu”        → key=TPO,           value=Jason Yu
+- “Inactive”            → key=Inactive,      value=Inactive  (flag-style tag)
+- “AppID=1243”          → key=AppID,         value=1243
+“””
+parsed = []
+for name in raw_tags:
+name = name.strip()
+if not name:
+continue
+if “:” in name:
+key, _, value = name.partition(”:”)
+parsed.append({“key”: key.strip(), “value”: value.strip()})
+elif “=” in name:
+key, _, value = name.partition(”=”)
+parsed.append({“key”: key.strip(), “value”: value.strip()})
+else:
+# Flag-style tag with no value (e.g. “Inactive”)
+parsed.append({“key”: name, “value”: name})
+return parsed
+
 def get_project_tags(session: requests.Session, server_url: str, collection_name: str, project_id: str) -> list[dict]:
 “””
-Fetch tags associated with a project.
-Endpoint: GET {server}/{collection}/_apis/tagging/scopes/{projectId}/tags?api-version=7.1-preview
-Returns list of {key, value} dicts. AzDO Server stores tags as name strings
-so we parse ‘key:value’ or treat the whole string as a tag key with value=True.
-“””
-url = f”{server_url}/{collection_name}/_apis/tagging/scopes/{project_id}/tags”
-data = api_get(session, url, params={“api-version”: “7.1-preview”, “includeInactive”: “false”})
-raw_tags = data.get(“value”, [])
+Fetch project-level tags as shown in the AzDO UI ‘About this project’ panel.
 
 ```
-parsed = []
-for tag in raw_tags:
-    name = tag.get("name", "").strip()
-    if not name:
-        continue
-    # Support both "Key:Value" and "Key=Value" formats; fallback to name-only
-    if ":" in name:
-        key, _, value = name.partition(":")
-        parsed.append({"key": key.strip(), "value": value.strip()})
-    elif "=" in name:
-        key, _, value = name.partition("=")
-        parsed.append({"key": key.strip(), "value": value.strip()})
-    else:
-        # Treat the tag name itself as the key, value as the tag name
-        parsed.append({"key": name, "value": name})
+AzDO Server stores these via the Project Properties API. Tags are stored
+under the property key "System.TeamProject.Tags" as a semicolon-delimited string,
+OR returned directly as a 'tags' field on the project detail endpoint.
 
-log.debug(f"    Project {project_id}: {len(parsed)} tag(s) → {parsed}")
-return parsed
+Strategy (3-level fallback):
+  1. GET {collection}/_apis/projects/{projectId}?includeCapabilities=true
+     → check project.tags[] array (AzDO Services style)
+  2. GET {collection}/_apis/projects/{projectId}/properties
+     → look for "System.TeamProject.Tags" property (semicolon-delimited string)
+  3. GET {collection}/_apis/tagging/scopes/{projectId}/tags  (legacy fallback)
+"""
+parsed = []
+
+# ── Strategy 1: project detail with tags array ──────────────────────────
+url1 = f"{server_url}/{collection_name}/_apis/projects/{project_id}"
+data1 = api_get(session, url1, params={"api-version": "7.1", "includeCapabilities": "true"})
+if data1:
+    # Some AzDO versions return tags as a list of strings directly on the project object
+    tags_list = data1.get("tags", [])
+    if isinstance(tags_list, list) and tags_list:
+        log.debug(f"    [Strategy 1] Project {project_id}: tags={tags_list}")
+        parsed = parse_tag_strings(tags_list)
+        if parsed:
+            return parsed
+
+    # Also check capabilities → tagNames (seen in some versions)
+    caps = data1.get("capabilities", {})
+    tag_names = caps.get("versioncontrol", {}).get("tagNames", [])
+    if not tag_names:
+        tag_names = caps.get("processTemplate", {}).get("tagNames", [])
+    if tag_names:
+        log.debug(f"    [Strategy 1b] Project {project_id}: tagNames={tag_names}")
+        parsed = parse_tag_strings(tag_names)
+        if parsed:
+            return parsed
+
+# ── Strategy 2: project properties API ──────────────────────────────────
+url2 = f"{server_url}/{collection_name}/_apis/projects/{project_id}/properties"
+data2 = api_get(session, url2, params={"api-version": "7.1-preview"})
+if data2:
+    props = data2.get("value", [])
+    for prop in props:
+        pname = prop.get("name", "")
+        pval  = prop.get("value", "")
+        # The UI tags are stored under this well-known property key
+        if pname in ("System.TeamProject.Tags", "Microsoft.TeamFoundation.Project.Tags"):
+            if isinstance(pval, str) and pval.strip():
+                # Tags are semicolon-separated: "AppInfo:11538-CRF;TMT:Scott Simpson;Inactive"
+                raw = [t.strip() for t in pval.split(";") if t.strip()]
+                log.debug(f"    [Strategy 2] Project {project_id}: raw props tags={raw}")
+                parsed = parse_tag_strings(raw)
+                if parsed:
+                    return parsed
+
+# ── Strategy 3: legacy work-item tagging API (last resort) ──────────────
+url3 = f"{server_url}/{collection_name}/_apis/tagging/scopes/{project_id}/tags"
+data3 = api_get(session, url3, params={"api-version": "7.1-preview", "includeInactive": "false"})
+if data3:
+    raw_tags = [t.get("name", "") for t in data3.get("value", [])]
+    if raw_tags:
+        log.debug(f"    [Strategy 3] Project {project_id}: legacy tags={raw_tags}")
+        parsed = parse_tag_strings(raw_tags)
+        if parsed:
+            return parsed
+
+log.debug(f"    Project {project_id}: no tags found across all strategies")
+return []
 ```
 
 def get_repos(session: requests.Session, server_url: str, collection_name: str, project_id: str) -> list[dict]:
